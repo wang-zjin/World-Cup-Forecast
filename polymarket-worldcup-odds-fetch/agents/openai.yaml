@@ -1,0 +1,7 @@
+interface:
+  display_name: "Polymarket 世界杯赔率获取"
+  short_description: "刷新 Polymarket 世界杯市场数据并生成本项目赔率表"
+  default_prompt: "Use $polymarket-worldcup-odds-fetch to fetch Polymarket World Cup market data and update 2026世界杯polymarket赔率.md."
+
+policy:
+  allow_implicit_invocation: true

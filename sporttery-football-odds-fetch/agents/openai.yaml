@@ -1,0 +1,7 @@
+interface:
+  display_name: "体彩足球赔率获取"
+  short_description: "抓取体彩足球赔率并更新本项目赔率表"
+  default_prompt: "Use $sporttery-football-odds-fetch to fetch Sporttery football odds and update the project odds Markdown table."
+
+policy:
+  allow_implicit_invocation: true
