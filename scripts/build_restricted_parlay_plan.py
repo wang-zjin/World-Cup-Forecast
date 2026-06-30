@@ -49,9 +49,78 @@ def numeric(text: str) -> bool:
         return False
 
 
+def csv_set(value: str) -> set[str]:
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
 def single_win_allowed_matches() -> set[str]:
     raw = os.environ.get("WORLDCUP_SINGLE_WIN_ALLOWED", "加纳 vs 巴拿马")
-    return {item.strip() for item in raw.split(",") if item.strip()}
+    return csv_set(raw)
+
+
+def no_single_win_matches() -> set[str] | None:
+    raw = os.environ.get("WORLDCUP_NO_SINGLE_WIN")
+    if raw is None:
+        return None
+    return csv_set(raw)
+
+
+def no_single_handicap_matches() -> set[str] | None:
+    raw = os.environ.get("WORLDCUP_NO_SINGLE_HANDICAP")
+    if raw is None:
+        return None
+    return csv_set(raw)
+
+
+def uses_explicit_restrictions() -> bool:
+    return (
+        os.environ.get("WORLDCUP_NO_SINGLE_WIN") is not None
+        or os.environ.get("WORLDCUP_NO_SINGLE_HANDICAP") is not None
+    )
+
+
+def handicap_market(row: dict[str, object]) -> bool:
+    return str(row["market"]).startswith("让负")
+
+
+def win_market(row: dict[str, object]) -> bool:
+    return row["market"] == "胜负"
+
+
+def score_market(row: dict[str, object]) -> bool:
+    return row["market"] == "比分"
+
+
+def side_market(row: dict[str, object]) -> bool:
+    return win_market(row) or handicap_market(row)
+
+
+def parlay_mode() -> str:
+    return os.environ.get("WORLDCUP_PARLAY_MODE", "default")
+
+
+def parlay_market_allowed(left: dict[str, object], right: dict[str, object]) -> bool:
+    mode = parlay_mode()
+    if mode == "side-only":
+        return side_market(left) and side_market(right)
+    if mode == "no-score-with-side":
+        return not (
+            (score_market(left) and side_market(right))
+            or (side_market(left) and score_market(right))
+        )
+    return True
+
+
+def single_restricted_by_explicit_rules(row: dict[str, object]) -> bool:
+    no_single_win = no_single_win_matches() or set()
+    no_single_handicap = no_single_handicap_matches() or set()
+    return (
+        row["market"] == "胜负"
+        and row["match"] in no_single_win
+    ) or (
+        handicap_market(row)
+        and row["match"] in no_single_handicap
+    )
 
 
 def event_mask(row: dict[str, object]) -> np.ndarray:
@@ -152,16 +221,20 @@ def load_score_rows() -> tuple[list[dict[str, object]], dict[str, np.ndarray]]:
 
 
 def single_allowed(row: dict[str, object]) -> bool:
+    if uses_explicit_restrictions():
+        return not single_restricted_by_explicit_rules(row)
     if row["market"] == "比分":
         return True
     return row["market"] == "胜负" and row["match"] in single_win_allowed_matches()
 
 
 def restricted(row: dict[str, object]) -> bool:
+    if uses_explicit_restrictions():
+        return single_restricted_by_explicit_rules(row)
     return (
         row["market"] == "胜负"
         and row["match"] not in single_win_allowed_matches()
-    ) or str(row["market"]).startswith("让负")
+    ) or handicap_market(row)
 
 
 def variant_label(variant: dict[str, object]) -> str:
@@ -195,6 +268,8 @@ def build_variants(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             if left["match"] == right["match"]:
                 continue
             if not (restricted(left) or restricted(right)):
+                continue
+            if not parlay_market_allowed(left, right):
                 continue
             probability = float(left["p"]) * float(right["p"])
             odds = float(left["odds"]) * float(right["odds"])
@@ -387,18 +462,54 @@ def print_report(
 def main() -> None:
     parser = argparse.ArgumentParser(description="按单关限制生成 2026 世界杯策略三/四串关扩展方案")
     parser.add_argument(
+        "--base",
+        choices=("direct", "score", "both"),
+        default="both",
+        help="选择直接同口径事件、比分分布事件，或两者都输出",
+    )
+    parser.add_argument(
+        "--title",
+        default=None,
+        help="只输出一个 base 时可覆盖报告标题",
+    )
+    parser.add_argument(
         "--single-win-allowed",
         default=os.environ.get("WORLDCUP_SINGLE_WIN_ALLOWED", "加纳 vs 巴拿马"),
         help="逗号分隔的可单关胜负比赛，默认读取 WORLDCUP_SINGLE_WIN_ALLOWED 或使用加纳 vs 巴拿马",
     )
+    parser.add_argument(
+        "--no-single-win",
+        default=os.environ.get("WORLDCUP_NO_SINGLE_WIN"),
+        help="逗号分隔的禁止胜负单关比赛；设置后优先使用显式限制口径",
+    )
+    parser.add_argument(
+        "--no-single-handicap",
+        default=os.environ.get("WORLDCUP_NO_SINGLE_HANDICAP"),
+        help="逗号分隔的禁止让负单关比赛；设置后优先使用显式限制口径",
+    )
+    parser.add_argument(
+        "--parlay-mode",
+        choices=("default", "no-score-with-side", "side-only"),
+        default=os.environ.get("WORLDCUP_PARLAY_MODE", "default"),
+        help="串关市场限制：default 为旧规则，no-score-with-side 禁止比分和胜负/让负串，side-only 只允许胜负/让负串",
+    )
     args = parser.parse_args()
     os.environ["WORLDCUP_SINGLE_WIN_ALLOWED"] = args.single_win_allowed
+    os.environ["WORLDCUP_PARLAY_MODE"] = args.parlay_mode
+    if args.no_single_win is not None:
+        os.environ["WORLDCUP_NO_SINGLE_WIN"] = args.no_single_win
+    if args.no_single_handicap is not None:
+        os.environ["WORLDCUP_NO_SINGLE_HANDICAP"] = args.no_single_handicap
 
-    direct_rows = load_direct_rows()
-    print_report("策略三：策略一限制后事件空间", direct_rows, build_variants(direct_rows), None)
+    if args.base in {"direct", "both"}:
+        direct_title = args.title if args.base == "direct" and args.title else "策略三：策略一限制后事件空间"
+        direct_rows = load_direct_rows()
+        print_report(direct_title, direct_rows, build_variants(direct_rows), None)
 
-    score_rows, matrices = load_score_rows()
-    print_report("策略四：策略二限制后事件空间", score_rows, build_variants(score_rows), matrices)
+    if args.base in {"score", "both"}:
+        score_title = args.title if args.base == "score" and args.title else "策略四：策略二限制后事件空间"
+        score_rows, matrices = load_score_rows()
+        print_report(score_title, score_rows, build_variants(score_rows), matrices)
 
 
 if __name__ == "__main__":

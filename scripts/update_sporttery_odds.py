@@ -14,6 +14,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 ODDS_PATH = ROOT / "2026世界杯体彩赔率.md"
+SCHEDULE_PATH = ROOT / "2026世界杯赛程_北京时间.md"
 API_URL = "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=c&poolCode=had,hhad,crs"
 BJT = timezone(timedelta(hours=8))
 
@@ -108,43 +109,68 @@ def canonical_matchup(home: str, away: str) -> str:
 
 def fetch_sporttery() -> dict[str, Any]:
     errors: list[str] = []
-    for attempt in range(1, 4):
-        request = urllib.request.Request(API_URL, headers=REQUEST_HEADERS)
-        try:
-            with urllib.request.urlopen(request, timeout=45) as response:
-                body = response.read().decode("utf-8")
-            return parse_payload(body)
-        except (urllib.error.URLError, TimeoutError) as exc:
-            errors.append(f"urllib attempt {attempt}: {exc}")
+    body = fetch_sporttery_via_curl(errors)
+    if body is not None:
+        return parse_payload(body)
 
-    curl_cmd = [
+    request = urllib.request.Request(API_URL, headers=REQUEST_HEADERS)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode("utf-8")
+        return parse_payload(body)
+    except (urllib.error.URLError, TimeoutError) as exc:
+        errors.append(f"urllib fallback: {exc}")
+        raise RuntimeError("体彩接口请求失败：" + " | ".join(errors)) from exc
+
+
+def fetch_sporttery_via_curl(errors: list[str]) -> str | None:
+    base_cmd = [
         "curl",
         "--silent",
         "--show-error",
         "--location",
-        "--retry",
-        "3",
-        "--retry-delay",
-        "2",
         "--connect-timeout",
-        "20",
+        "15",
         "--max-time",
-        "90",
+        "60",
         "--http1.1",
         "--ipv4",
-        API_URL,
     ]
+    header_args: list[str] = []
     for key, value in REQUEST_HEADERS.items():
-        curl_cmd.extend(["-H", f"{key}: {value}"])
+        header_args.extend(["-H", f"{key}: {value}"])
 
-    try:
-        completed = subprocess.run(curl_cmd, check=True, capture_output=True, text=True)
-        body = completed.stdout
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        errors.append(f"curl fallback: {exc}")
-        raise RuntimeError("体彩接口请求失败：" + " | ".join(errors)) from exc
-
-    return parse_payload(body)
+    # macOS 自带 Python(LibreSSL) 对该域名 SSL 握手常超时；curl 更稳定。
+    # 若默认解析到的 IP 握手失败(exit 35)，依次固定到已知可用 IP 重试。
+    resolve_targets: list[str | None] = [
+        None,
+        "webapi.sporttery.cn:443:117.185.125.154",
+        "webapi.sporttery.cn:443:183.192.184.85",
+    ]
+    for index, resolve in enumerate(resolve_targets, start=1):
+        curl_cmd = base_cmd.copy()
+        if resolve:
+            curl_cmd.extend(["--resolve", resolve])
+        curl_cmd.append(API_URL)
+        curl_cmd.extend(header_args)
+        label = resolve or "default"
+        try:
+            completed = subprocess.run(
+                curl_cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=75,
+            )
+            if completed.stdout.strip():
+                return completed.stdout
+            errors.append(f"curl {label}: empty response")
+        except FileNotFoundError as exc:
+            errors.append(f"curl {label}: {exc}")
+            return None
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"curl {label}: {exc}")
+    return None
 
 
 def parse_payload(body: str) -> dict[str, Any]:
@@ -170,6 +196,28 @@ def api_matches(payload: dict[str, Any]) -> dict[tuple[str, str, str], dict[str,
     return matches
 
 
+def load_schedule() -> dict[tuple[str, str], list[str]]:
+    schedule: dict[tuple[str, str], list[str]] = {}
+    if not SCHEDULE_PATH.exists():
+        return schedule
+
+    for line in SCHEDULE_PATH.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("| ") or line.startswith("| 场次 ") or line.startswith("|---"):
+            continue
+        cells = markdown_cells(line)
+        if len(cells) < 5 or not cells[0].isdigit() or " vs " not in cells[4]:
+            continue
+        date_text = row_date(cells[2])
+        time_text = cells[3].strip()
+        home, away = (part.strip() for part in cells[4].split(" vs ", 1))
+        matchup = canonical_matchup(home, away)
+        key = (date_text, time_text)
+        schedule.setdefault(key, [])
+        if matchup not in schedule[key]:
+            schedule[key].append(matchup)
+    return schedule
+
+
 def markdown_cells(line: str) -> list[str]:
     return [cell.strip() for cell in line.strip().strip("|").split("|")]
 
@@ -192,6 +240,7 @@ def odds_value(pool: dict[str, Any], key: str | None) -> str:
 def update_lines(
     lines: list[str],
     matches: dict[tuple[str, str, str], dict[str, Any]],
+    schedule: dict[tuple[str, str], list[str]],
     date_text: str,
 ) -> tuple[list[str], dict[str, Any]]:
     stats: dict[str, Any] = {
@@ -199,8 +248,10 @@ def update_lines(
         "updated_odds": 0,
         "dash_odds": 0,
         "changed_handicap_rows": 0,
+        "changed_matchup_rows": 0,
         "matched_matchups": set(),
         "unmatched_matchups": set(),
+        "schedule_resolved_matchups": set(),
     }
     new_lines: list[str] = []
 
@@ -220,17 +271,39 @@ def update_lines(
             continue
 
         stats["target_rows"] += 1
-        match = matches.get((date_text, row_time(time_text), matchup))
+        time_value = row_time(time_text)
+        effective_matchup = matchup
+        match = matches.get((date_text, time_value, effective_matchup))
+        if not match:
+            scheduled_matchups = schedule.get((date_text, time_value), [])
+            if len(scheduled_matchups) == 1:
+                effective_matchup = scheduled_matchups[0]
+            elif matchup in scheduled_matchups:
+                effective_matchup = matchup
+            else:
+                api_candidates = [
+                    candidate
+                    for candidate in scheduled_matchups
+                    if (date_text, time_value, candidate) in matches
+                ]
+                if len(api_candidates) == 1:
+                    effective_matchup = api_candidates[0]
+
+            if effective_matchup != matchup:
+                stats["changed_matchup_rows"] += 1
+                stats["schedule_resolved_matchups"].add(f"{matchup} -> {effective_matchup}")
+                match = matches.get((date_text, time_value, effective_matchup))
+
         odd = "-"
         new_market_type = market_type
 
         if not match:
-            stats["unmatched_matchups"].add(matchup)
+            stats["unmatched_matchups"].add(effective_matchup)
         elif market_type == "胜负":
-            stats["matched_matchups"].add(matchup)
+            stats["matched_matchups"].add(effective_matchup)
             odd = odds_value(match.get("had") or {}, RESULT_KEY.get(event_name))
         elif market_type.startswith("让负（"):
-            stats["matched_matchups"].add(matchup)
+            stats["matched_matchups"].add(effective_matchup)
             pool = match.get("hhad") or {}
             if pool:
                 new_market_type = f"让负（{pool.get('goalLine') or '0'}）"
@@ -238,7 +311,7 @@ def update_lines(
                     stats["changed_handicap_rows"] += 1
             odd = odds_value(pool, RESULT_KEY.get(event_name))
         elif market_type == "比分":
-            stats["matched_matchups"].add(matchup)
+            stats["matched_matchups"].add(effective_matchup)
             odd = odds_value(match.get("crs") or {}, SCORE_KEY.get(event_name))
 
         if odd == "-":
@@ -246,7 +319,7 @@ def update_lines(
         elif odd != old_odd or new_market_type != market_type:
             stats["updated_odds"] += 1
 
-        new_lines.append(f"| {time_text} | {matchup} | {new_market_type} | {event_name} | {odd} |")
+        new_lines.append(f"| {time_text} | {effective_matchup} | {new_market_type} | {event_name} | {odd} |")
 
     return new_lines, stats
 
@@ -264,8 +337,9 @@ def main() -> None:
     else:
         payload = fetch_sporttery()
     matches = api_matches(payload)
+    schedule = load_schedule()
     lines = ODDS_PATH.read_text(encoding="utf-8").splitlines()
-    new_lines, stats = update_lines(lines, matches, date_text)
+    new_lines, stats = update_lines(lines, matches, schedule, date_text)
 
     if stats["target_rows"] == 0:
         raise RuntimeError(f"{ODDS_PATH.name} 中未找到 {date_text} 的比赛行")
@@ -278,9 +352,11 @@ def main() -> None:
     print(f"Target rows: {stats['target_rows']}")
     print(f"Matched matchups: {len(stats['matched_matchups'])} {sorted(stats['matched_matchups'])}")
     print(f"Unmatched matchups: {len(stats['unmatched_matchups'])} {sorted(stats['unmatched_matchups'])}")
+    print(f"Schedule-resolved matchups: {len(stats['schedule_resolved_matchups'])} {sorted(stats['schedule_resolved_matchups'])}")
     print(f"Updated odds/type rows: {stats['updated_odds']}")
     print(f"Rows with '-': {stats['dash_odds']}")
     print(f"Changed handicap rows: {stats['changed_handicap_rows']}")
+    print(f"Changed matchup rows: {stats['changed_matchup_rows']}")
     print(f"Dry run: {args.dry_run}")
 
 

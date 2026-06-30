@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +18,10 @@ PNG_PATH = ROOT / "2026世界杯赛程_北京时间.png"
 
 FIXTURE_PAGE = "https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/scores-fixtures"
 API_URL = "https://api.fifa.com/api/v3/calendar/matches?language=en&count=500&idCompetition=17&idSeason=285023"
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 world-cup-schedule-refresh/1.0",
+    "Accept": "application/json",
+}
 BJT = timezone(timedelta(hours=8))
 WEEK_ZH = "一二三四五六日"
 
@@ -179,13 +185,46 @@ def venue_name(match: dict[str, Any]) -> str:
     return name or city
 
 
-def fetch_rows() -> list[dict[str, Any]]:
-    request = urllib.request.Request(
+def fetch_payload() -> dict[str, Any]:
+    errors: list[str] = []
+    for attempt in range(1, 4):
+        request = urllib.request.Request(API_URL, headers=REQUEST_HEADERS)
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError) as exc:
+            errors.append(f"urllib attempt {attempt}: {exc}")
+
+    curl_cmd = [
+        "curl",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--retry",
+        "3",
+        "--retry-delay",
+        "2",
+        "--connect-timeout",
+        "20",
+        "--max-time",
+        "90",
+        "--http1.1",
+        "--ipv4",
         API_URL,
-        headers={"User-Agent": "Mozilla/5.0 world-cup-schedule-refresh/1.0", "Accept": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    ]
+    for key, value in REQUEST_HEADERS.items():
+        curl_cmd.extend(["-H", f"{key}: {value}"])
+
+    try:
+        completed = subprocess.run(curl_cmd, check=True, capture_output=True, text=True)
+        return json.loads(completed.stdout)
+    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as exc:
+        errors.append(f"curl fallback: {exc}")
+        raise RuntimeError("FIFA API 请求失败：" + " | ".join(errors)) from exc
+
+
+def fetch_rows() -> list[dict[str, Any]]:
+    payload = fetch_payload()
 
     rows: list[dict[str, Any]] = []
     for match in payload.get("Results", []):
