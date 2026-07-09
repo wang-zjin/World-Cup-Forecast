@@ -78,6 +78,14 @@ def load_sporttery_rows(target_matches: tuple[str, ...]) -> list[dict[str, objec
     return rows
 
 
+def total_goals_hit(event_name: str, home_goals: int, away_goals: int) -> bool:
+    total = home_goals + away_goals
+    exact = re.match(r"^(\d+)球$", event_name)
+    if exact:
+        return total == int(exact.group(1))
+    return event_name in {"7+球", "7球及以上"} and total >= 7
+
+
 def score_mask(matrix: np.ndarray, market_type: str, event_name: str) -> np.ndarray:
     mask = np.zeros(matrix.shape, dtype=bool)
     for home_goals in range(matrix.shape[0]):
@@ -109,6 +117,8 @@ def score_mask(matrix: np.ndarray, market_type: str, event_name: str) -> np.ndar
                     hit = home_goals < away_goals and score not in EXACT_AWAY_WINS
                 else:
                     hit = False
+            elif market_type == "进球数":
+                hit = total_goals_hit(event_name, home_goals, away_goals)
             else:
                 hit = False
 

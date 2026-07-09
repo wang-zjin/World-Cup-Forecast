@@ -15,7 +15,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 ODDS_PATH = ROOT / "2026世界杯体彩赔率.md"
 SCHEDULE_PATH = ROOT / "2026世界杯赛程_北京时间.md"
-API_URL = "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=c&poolCode=had,hhad,crs"
+API_URL = "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=c&poolCode=had,hhad,crs,ttg"
 BJT = timezone(timedelta(hours=8))
 
 RESULT_KEY = {"胜": "h", "平": "d", "负": "a"}
@@ -51,6 +51,16 @@ SCORE_KEY = {
     "1:5": "s01s05",
     "2:5": "s02s05",
     "负其他": "s1sa",
+}
+TOTAL_GOALS_KEY = {
+    "0球": "s0",
+    "1球": "s1",
+    "2球": "s2",
+    "3球": "s3",
+    "4球": "s4",
+    "5球": "s5",
+    "6球": "s6",
+    "7+球": "s7",
 }
 
 TEAM_ALIASES = {
@@ -313,6 +323,9 @@ def update_lines(
         elif market_type == "比分":
             stats["matched_matchups"].add(effective_matchup)
             odd = odds_value(match.get("crs") or {}, SCORE_KEY.get(event_name))
+        elif market_type == "进球数":
+            stats["matched_matchups"].add(effective_matchup)
+            odd = odds_value(match.get("ttg") or {}, TOTAL_GOALS_KEY.get(event_name))
 
         if odd == "-":
             stats["dash_odds"] += 1
